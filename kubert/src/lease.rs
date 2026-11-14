@@ -8,7 +8,7 @@
 //! only a single claimant owns the lease at a time.
 
 use k8s_openapi::{api::coordination::v1 as coordv1, apimachinery::pkg::apis::meta::v1 as metav1};
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, sync::{Arc, atomic::{AtomicBool, Ordering}}};
 use tokio::time::{self, Duration};
 
 #[cfg(all(feature = "runtime", feature = "runtime-diagnostics"))]
@@ -63,7 +63,7 @@ pub struct ClaimParams {
 }
 
 /// Describes the state of a lease
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 #[cfg_attr(docsrs, doc(cfg(feature = "lease")))]
 pub struct Claim {
     /// The identity of the claim holder.
@@ -71,6 +71,11 @@ pub struct Claim {
 
     /// The time that the lease expires.
     pub expiry: chrono::DateTime<chrono::Utc>,
+
+    // A wall-clock rollback must not extend an observed claim. The timestamp is
+    // retained for diagnostics, but cannot by itself establish local validity.
+    valid_until: time::Instant,
+    expired: Arc<AtomicBool>,
 }
 
 /// Indicates an error interacting with the Lease API
@@ -92,6 +97,18 @@ pub enum Error {
     /// A Kubernetes API call timed out
     #[error("timed out")]
     Timeout,
+
+    /// Parameters cannot be represented by a positive Kubernetes lease.
+    #[error("invalid lease parameters")]
+    InvalidParameters,
+
+    /// The server supplied an invalid transition count or it cannot advance.
+    #[error("lease transition counter is invalid or exhausted")]
+    InvalidTransitions,
+
+    /// A reply arrived after the previous local ownership bound elapsed.
+    #[error("lease expired during renewal")]
+    Expired,
 }
 
 #[derive(Clone, Debug)]
@@ -103,7 +120,7 @@ struct State {
 #[derive(Clone, Debug)]
 struct Meta {
     version: String,
-    transitions: u16,
+    transitions: i32,
 }
 
 pub(crate) type Api = kube_client::Api<coordv1::Lease>;
@@ -127,10 +144,20 @@ impl Default for ClaimParams {
 // === impl Claim ===
 
 impl Claim {
-    /// Returns true iff the claim is still valid according to the system clock
+    /// Remaining local validity, bounded by both the reported wall-clock expiry
+    /// and the monotonic deadline established when this version was observed.
+    pub fn remaining(&self) -> Duration {
+        if self.expired.load(Ordering::Acquire) { return Duration::ZERO; }
+        let remaining = self.valid_until.saturating_duration_since(time::Instant::now())
+            .min((self.expiry - chrono::Utc::now()).to_std().unwrap_or_default());
+        if remaining.is_zero() { self.expired.store(true, Ordering::Release); }
+        remaining
+    }
+
+    /// Returns true iff neither observed expiry bound has elapsed.
     #[inline]
     pub fn is_current(&self) -> bool {
-        chrono::Utc::now() < self.expiry
+        !self.remaining().is_zero()
     }
 
     /// Returns true iff the claim is still valid for the provided claimant
@@ -146,12 +173,32 @@ impl Claim {
 
     /// Waits until there is a grace period remaining before the claim expires
     pub async fn expire_with_grace(&self, grace: Duration) {
-        if let Ok(remaining) = (self.expiry - chrono::Utc::now()).to_std() {
-            let sleep = remaining.saturating_sub(grace);
-            if !sleep.is_zero() {
-                tokio::time::sleep(sleep).await;
+        let sleep = self.remaining().saturating_sub(grace);
+        if !sleep.is_zero() {
+            tokio::time::sleep(sleep).await;
+        }
+    }
+}
+
+impl PartialEq for Claim {
+    fn eq(&self, other: &Self) -> bool { self.holder == other.holder && self.expiry == other.expiry }
+}
+impl Eq for Claim {}
+
+impl State {
+    fn observe(&mut self, mut next: Self) {
+        if let (Some(previous), Some(current)) = (&self.claim, next.claim.as_ref()) {
+            // Metadata-only writes also change resourceVersion. They must not
+            // extend the lifetime of the same observed ownership timestamp.
+            if self.meta.transitions == next.meta.transitions
+                && previous.holder == current.holder && previous.expiry == current.expiry {
+                    let mut current = (**current).clone();
+                    current.valid_until = current.valid_until.min(previous.valid_until);
+                    current.expired = previous.expired.clone();
+                    next.claim = Some(Arc::new(current));
             }
         }
+        *self = next;
     }
 }
 
@@ -159,8 +206,6 @@ impl Claim {
 
 impl LeaseManager {
     pub(crate) const DEFAULT_FIELD_MANAGER: &'static str = "kubert";
-    const DEFAULT_MIN_BACKOFF: Duration = Duration::from_millis(5);
-    const DEFAULT_BACKOFF_JITTER: f32 = 0.5; // up to 50% of the backoff duration
     const API_TIMEOUT: Duration = Duration::from_secs(10);
 
     /// Initialize a lease's state from the Kubernetes API.
@@ -202,13 +247,15 @@ impl LeaseManager {
 
     /// Update the state of the claim from the API.
     pub async fn sync(&self) -> Result<Option<Arc<Claim>>, Error> {
-        let mut state = self.state.lock().await;
-        *state = Self::get(self.api.clone(), &self.name).await?;
-        #[cfg(all(feature = "runtime", feature = "runtime-diagnostics"))]
-        if let Some(diagnostics) = self.diagnostics.as_ref() {
-            diagnostics.inspect(state.claim.clone(), state.meta.version.clone());
-        }
-        Ok(state.claim.clone())
+        time::timeout(Self::API_TIMEOUT, async {
+            let mut state = self.state.lock().await;
+            state.observe(Self::get(self.api.clone(), &self.name).await?);
+            #[cfg(all(feature = "runtime", feature = "runtime-diagnostics"))]
+            if let Some(diagnostics) = self.diagnostics.as_ref() {
+                diagnostics.inspect(state.claim.clone(), state.meta.version.clone());
+            }
+            Ok(state.claim.clone())
+        }).await.map_err(|_| Error::Timeout)?
     }
 
     /// Ensures that the lease, if it exists, is claimed.
@@ -221,16 +268,29 @@ impl LeaseManager {
         claimant: &str,
         params: &ClaimParams,
     ) -> Result<Arc<Claim>, Error> {
+        // Bound the complete operation, including mutex waits and repeated CAS
+        // conflicts. Individual HTTP timeouts alone do not bound that loop.
+        time::timeout(Self::API_TIMEOUT, self.ensure_claimed_inner(claimant, params))
+            .await.map_err(|_| Error::Timeout)?
+    }
+
+    async fn ensure_claimed_inner(&self, claimant: &str, params: &ClaimParams) -> Result<Arc<Claim>, Error> {
+        if claimant.is_empty() || claimant.len() > 256 || claimant.chars().any(char::is_control)
+            || params.lease_duration.is_zero() || params.lease_duration.subsec_nanos() != 0
+            || params.lease_duration.as_secs() > i32::MAX as u64
+            || params.renew_grace_period >= params.lease_duration {
+            return Err(Error::InvalidParameters);
+        }
         let mut state = self.state.lock().await;
+        // Every ownership decision starts with a fresh resourceVersion/holder.
+        // A cached unexpired claim is not evidence of current server ownership.
+        state.observe(Self::get(self.api.clone(), &self.name).await?);
         loop {
             if let Some(claim) = state.claim.as_ref() {
                 // If the claim is held by the provided claimant, then consider
                 // renewing the claim.
-                if claim.holder == claimant {
-                    let renew_at = claim.expiry
-                        - chrono::Duration::from_std(params.renew_grace_period)
-                            .unwrap_or_else(|_| chrono::Duration::zero());
-                    if chrono::Utc::now() < renew_at {
+                if claim.holder == claimant && claim.is_current() {
+                    if claim.remaining() > params.renew_grace_period {
                         return Ok(claim.clone());
                     }
 
@@ -240,7 +300,7 @@ impl LeaseManager {
                         Err(e) if Self::is_conflict(&e) => {
                             // Another process updated the claim's resource version, so
                             // re-sync the state and try again.
-                            *state = Self::get(self.api.clone(), &self.name).await?;
+                            state.observe(Self::get(self.api.clone(), &self.name).await?);
                             #[cfg(all(feature = "runtime", feature = "runtime-diagnostics"))]
                             if let Some(diagnostics) = self.diagnostics.as_ref() {
                                 diagnostics
@@ -251,6 +311,10 @@ impl LeaseManager {
 
                         Err(e) => return Err(e),
                     };
+
+                    if state.claim.as_ref().is_none_or(|prior| !prior.is_current()) {
+                        return Err(Error::Expired);
+                    }
 
                     *state = State {
                         claim: Some(claim.clone()),
@@ -276,7 +340,7 @@ impl LeaseManager {
                 Err(e) if Self::is_conflict(&e) => {
                     // Another process updated the claim's resource version, so
                     // re-sync the state and try again.
-                    *state = Self::get(self.api.clone(), &self.name).await?;
+                    state.observe(Self::get(self.api.clone(), &self.name).await?);
                     #[cfg(all(feature = "runtime", feature = "runtime-diagnostics"))]
                     if let Some(diagnostics) = self.diagnostics.as_ref() {
                         diagnostics.inspect(state.claim.clone(), state.meta.version.clone());
@@ -306,8 +370,14 @@ impl LeaseManager {
     /// This is typically used during process shutdown so that another process
     /// can potentially claim the lease before the prior lease duration expires.
     pub async fn vacate(&self, claimant: &str) -> Result<bool, Error> {
+        time::timeout(Self::API_TIMEOUT, self.vacate_inner(claimant))
+            .await.map_err(|_| Error::Timeout)?
+    }
+
+    async fn vacate_inner(&self, claimant: &str) -> Result<bool, Error> {
         let mut state = self.state.lock().await;
-        let Some(claim) = state.claim.take() else {
+        state.observe(Self::get(self.api.clone(), &self.name).await?);
+        let Some(claim) = state.claim.clone() else {
             return Ok(false);
         };
 
@@ -316,14 +386,10 @@ impl LeaseManager {
         }
 
         if claim.holder != claimant {
-            state.claim = Some(claim);
             return Ok(false);
         }
 
-        #[cfg_attr(
-            not(all(feature = "runtime", feature = "runtime-diagnostics")),
-            allow(unused_variables)
-        )]
+        let observed = time::Instant::now();
         let lease = self
             .patch(&kube_client::api::Patch::Strategic(serde_json::json!({
                 "apiVersion": "coordination.k8s.io/v1",
@@ -341,11 +407,12 @@ impl LeaseManager {
             })))
             .await?;
 
+        state.observe(Self::from_lease(lease, observed)?);
         #[cfg(all(feature = "runtime", feature = "runtime-diagnostics"))]
         if let Some(diagnostics) = self.diagnostics.as_ref() {
             diagnostics.inspect(
-                None,
-                lease.metadata.resource_version.clone().unwrap_or_default(),
+                state.claim.clone(),
+                state.meta.version.clone(),
             );
         }
 
@@ -371,12 +438,6 @@ impl LeaseManager {
         let mut claim = self.ensure_claimed(&claimant, &params).await?;
         let (tx, rx) = tokio::sync::watch::channel(claim.clone());
 
-        use backon::Retryable;
-        let new_backoff = backon::ExponentialBuilder::default();
-        new_backoff
-            .with_min_delay(Self::DEFAULT_MIN_BACKOFF)
-            .with_factor(Self::DEFAULT_BACKOFF_JITTER);
-
         let task = tokio::spawn(async move {
             loop {
                 // The claimant has the privilege of renewing the lease before
@@ -395,23 +456,13 @@ impl LeaseManager {
                     _ = claim.expire_with_grace(grace) => {}
                 }
 
-                // Update the claim and broadcast it to all receivers.
-                let backoff = new_backoff.with_max_delay(grace);
-                claim = (|| async { self.ensure_claimed(&claimant, &params).await })
-                    .retry(backoff)
-                    .when(|err| match err {
-                        Error::Api(kube_client::Error::Auth(_))
-                        | Error::Api(kube_client::Error::Discovery(_))
-                        | Error::Api(kube_client::Error::BuildRequest(_)) => false,
-                        Error::Api(kube_client::Error::InferConfig(_)) => {
-                            debug_assert!(false, "InferConfig errors should only be returned when constructing a new client");
-                            false
-                        },
-                        // Retry any other API request errors.
-                        _ => true,
-                    })
-                    .notify(|error, sleep| tracing::debug!(%error, ?sleep, "Error claiming lease, retrying..."))
-                    .await?;
+                // An uncertain API result ends this campaign. Do not keep an
+                // apparently healthy watch channel alive behind unbounded retry.
+                claim = tokio::select! {
+                    biased;
+                    _ = tx.closed() => break,
+                    result = self.ensure_claimed(&claimant, &params) => result?,
+                };
                 if tx.send(claim.clone()).is_err() {
                     // All receivers have been dropped.
                     break;
@@ -437,9 +488,11 @@ impl LeaseManager {
         claimant: &str,
         params: &ClaimParams,
     ) -> Result<(Arc<Claim>, Meta), Error> {
-        let lease_duration =
-            chrono::Duration::from_std(params.lease_duration).unwrap_or(chrono::Duration::MAX);
+        let lease_duration = chrono::Duration::from_std(params.lease_duration)
+            .map_err(|_| Error::InvalidParameters)?;
         let now = chrono::Utc::now();
+        let observed = time::Instant::now();
+        let transitions = meta.transitions.checked_add(1).ok_or(Error::InvalidTransitions)?;
         let lease = self
             .patch(&kube_client::api::Patch::Apply(serde_json::json!({
                 "apiVersion": "coordination.k8s.io/v1",
@@ -452,23 +505,17 @@ impl LeaseManager {
                     "renewTime": metav1::MicroTime(now),
                     "holderIdentity": claimant,
                     "leaseDurationSeconds": lease_duration.num_seconds(),
-                    "leaseTransitions": meta.transitions + 1,
+                    "leaseTransitions": transitions,
                 },
             })))
             .await?;
 
-        let claim = Claim {
-            holder: claimant.to_string(),
-            expiry: now + lease_duration,
-        };
-        let meta = Meta {
-            version: lease
-                .metadata
-                .resource_version
-                .ok_or(Error::MissingResourceVersion)?,
-            transitions: meta.transitions + 1,
-        };
-        Ok((claim.into(), meta))
+        let state = Self::from_lease(lease, observed)?;
+        let claim = state.claim.ok_or(Error::InvalidParameters)?;
+        if claim.holder != claimant || state.meta.transitions != transitions || !claim.is_current() {
+            return Err(Error::InvalidParameters);
+        }
+        Ok((claim, state.meta))
     }
 
     /// Renew the lease (i.e. assuming the claimant IS the current holder of the
@@ -483,9 +530,10 @@ impl LeaseManager {
         claimant: &str,
         params: &ClaimParams,
     ) -> Result<(Arc<Claim>, Meta), Error> {
-        let lease_duration =
-            chrono::Duration::from_std(params.lease_duration).unwrap_or(chrono::Duration::MAX);
+        let lease_duration = chrono::Duration::from_std(params.lease_duration)
+            .map_err(|_| Error::InvalidParameters)?;
         let now = chrono::Utc::now();
+        let observed = time::Instant::now();
         let lease = self
             .patch(&kube_client::api::Patch::Strategic(serde_json::json!({
                 "apiVersion": "coordination.k8s.io/v1",
@@ -494,24 +542,19 @@ impl LeaseManager {
                     "resourceVersion": meta.version,
                 },
                 "spec": {
+                    "holderIdentity": claimant,
                     "renewTime": metav1::MicroTime(now),
                     "leaseDurationSeconds": lease_duration.num_seconds(),
                 },
             })))
             .await?;
 
-        let claim = Claim {
-            holder: claimant.to_string(),
-            expiry: now + lease_duration,
-        };
-        let meta = Meta {
-            version: lease
-                .metadata
-                .resource_version
-                .ok_or(Error::MissingResourceVersion)?,
-            transitions: meta.transitions,
-        };
-        Ok((claim.into(), meta))
+        let state = Self::from_lease(lease, observed)?;
+        let claim = state.claim.ok_or(Error::InvalidParameters)?;
+        if claim.holder != claimant || state.meta.transitions != meta.transitions || !claim.is_current() {
+            return Err(Error::InvalidParameters);
+        }
+        Ok((claim, state.meta))
     }
 
     async fn patch<P>(&self, patch: &kube_client::api::Patch<P>) -> Result<coordv1::Lease, Error>
@@ -537,16 +580,23 @@ impl LeaseManager {
     }
 
     async fn get(api: Api, name: &str) -> Result<State, Error> {
+        let observed = time::Instant::now();
         let lease = time::timeout(Self::API_TIMEOUT, api.get(name))
             .await
             .map_err(|_| Error::Timeout)??;
-        let spec = lease.spec.ok_or(Error::MissingSpec)?;
+        Self::from_lease(lease, observed)
+    }
+
+    fn from_lease(lease: coordv1::Lease, observed: time::Instant) -> Result<State, Error> {
+        // Kubernetes may omit an empty optional spec for a pre-created Lease.
+        let spec = lease.spec.unwrap_or_default();
 
         let version = lease
             .metadata
             .resource_version
             .ok_or(Error::MissingResourceVersion)?;
-        let transitions = spec.lease_transitions.unwrap_or(0).try_into().unwrap_or(0);
+        let transitions = spec.lease_transitions.unwrap_or(0);
+        if transitions < 0 { return Err(Error::InvalidTransitions); }
         let meta = Meta {
             version,
             transitions,
@@ -564,18 +614,22 @@ impl LeaseManager {
         }
 
         let holder = or_unclaimed!(spec.holder_identity);
+        if holder.is_empty() { return Ok(State { meta, claim: None }); }
 
         let metav1::MicroTime(renew_time) = or_unclaimed!(spec.renew_time);
-        let lease_duration =
-            chrono::Duration::seconds(or_unclaimed!(spec.lease_duration_seconds).into());
-        let expiry = renew_time + lease_duration;
-        if expiry <= chrono::Utc::now() {
-            return Ok(State { meta, claim: None });
-        }
+        let seconds = or_unclaimed!(spec.lease_duration_seconds);
+        if seconds <= 0 { return Err(Error::InvalidParameters); }
+        let lease_duration = chrono::Duration::seconds(seconds.into());
+        let expiry = renew_time.checked_add_signed(lease_duration).ok_or(Error::InvalidParameters)?;
+        let remaining = (expiry - chrono::Utc::now()).to_std().unwrap_or_default()
+            .min(Duration::from_secs(seconds as u64));
+        let valid_until = observed.checked_add(remaining).ok_or(Error::InvalidParameters)?;
 
         Ok(State {
             meta,
-            claim: Some(Arc::new(Claim { holder, expiry })),
+            // Retain an expired observation too: a later GET of the same version
+            // must not resurrect it after a wall-clock rollback.
+            claim: Some(Arc::new(Claim { holder, expiry, valid_until, expired: Arc::new(AtomicBool::new(false)) })),
         })
     }
 

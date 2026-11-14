@@ -75,7 +75,6 @@ initialized = [
     "tokio/sync",
 ]
 lease = [
-    "dep:backon",
     "dep:chrono",
     "dep:futures-util",
     "dep:hyper",
@@ -86,7 +85,11 @@ lease = [
     "dep:serde_json",
     "dep:thiserror",
     "dep:tracing",
+    "chrono/clock",
+    "tokio/macros",
+    "tokio/rt",
     "tokio/sync",
+    "tokio/time",
 ]
 log = ["dep:thiserror", "dep:tracing", "dep:tracing-subscriber"]
 prometheus-client = [
@@ -181,7 +184,6 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
 
 [dependencies]
 ahash = { version = "0.8", optional = true }
-backon = { version = "1", optional = true, features = ["tokio-sleep"] }
 bytes = { version = "1", optional = true }
 drain = { version = "0.2.1", optional = true, default-features = false }
 chrono = { version = "0.4", optional = true, default-features = false }
