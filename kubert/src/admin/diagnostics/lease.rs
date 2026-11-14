@@ -94,7 +94,7 @@ impl LeaseDiagnostics {
         state.current = claim
             .as_deref()
             .cloned()
-            .map(|crate::lease::Claim { holder, expiry }| Claim {
+            .map(|crate::lease::Claim { holder, expiry, .. }| Claim {
                 holder,
                 expiry: Time(expiry),
             });
